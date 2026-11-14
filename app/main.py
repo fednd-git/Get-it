@@ -147,7 +147,7 @@ def ydl_opts(**extra) -> dict:
     return opts
 
 
-def friendly(err: Exception) -> str:
+def friendly(err: Exception, downloading: bool = False) -> str:
     print(f"[get-it] {type(err).__name__}: {err}", flush=True)  # real reason shows in the host's logs
     msg = str(err).lower()
     if "not a bot" in msg or "confirm you" in msg or "failed to extract any player response" in msg or "po token" in msg:
@@ -160,6 +160,8 @@ def friendly(err: Exception) -> str:
         return "This post is gone or the link has expired. Copy it again."
     if "max_filesize" in msg or "larger than" in msg:
         return "That file is too big for this server."
+    if downloading:
+        return "Couldn't download this one. Try another quality, or try again in a minute."
     return "Couldn't read that link. Check it opens in your browser, then try again."
 
 
@@ -171,8 +173,17 @@ def short_side(f: dict) -> int:
     return min(w, h) if w and h else (h or w)
 
 
-def has_v(f): return f.get("vcodec") not in (None, "none")
-def has_a(f): return f.get("acodec") not in (None, "none")
+def has_v(f: dict) -> bool:
+    """Has picture. Some sites (X) leave codecs blank on their plain MP4s, so a blank codec
+    with a known size counts as video."""
+    vc = f.get("vcodec")
+    return vc != "none" and (vc is not None or bool(f.get("height") or f.get("width")))
+
+
+def has_a(f: dict) -> bool:
+    """Has sound. A blank audio codec counts unless the format is marked video-only."""
+    ac, vc = f.get("acodec"), f.get("vcodec")
+    return ac != "none" and (ac is not None or vc is None or vc == "none")
 
 
 def size_for(formats: list[dict], height: int | None) -> int | None:
@@ -195,13 +206,13 @@ def item_from_info(info: dict) -> dict:
     formats = info.get("formats") or []
     heights = sorted({short_side(f) for f in formats if has_v(f) and short_side(f)}, reverse=True)
     has_video = bool(heights) or info.get("vcodec") not in (None, "none") and info.get("ext") in ("mp4", "webm", "mov")
-    has_audio = any(f.get("acodec") not in (None, "none") for f in formats) or info.get("acodec") not in (None, "none")
+    has_audio = any(has_a(f) for f in formats) or info.get("acodec") not in (None, "none")
 
     qualities = []
     if heights:
         top = heights[0]
         for h in HEIGHTS:
-            if any(h * 0.75 <= x <= h * 1.05 for x in heights):
+            if any(h * 0.8 <= x <= h * 1.05 for x in heights):
                 qualities.append({"id": str(h), "label": f"{h}p", "size": size_for(formats, h)})
         if not qualities:
             qualities.append({"id": str(top), "label": f"{top}p", "size": size_for(formats, top)})
@@ -516,7 +527,8 @@ def download_saved(
                 else:
                     extra["format"] = "ba[ext=m4a]/ba/b"
             elif spec:
-                extra["format"] = spec
+                h = int(quality) if quality.isdigit() else 4320
+                extra["format"] = f"{spec}/bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"
                 extra["merge_output_format"] = "mp4"
                 extra["noplaylist"] = True
             elif FFMPEG:
@@ -545,7 +557,7 @@ def download_saved(
         raise
     except Exception as e:  # noqa: BLE001
         shutil.rmtree(workdir, ignore_errors=True)
-        raise HTTPException(422, friendly(e))
+        raise HTTPException(422, friendly(e, downloading=True))
 
 
 @app.get("/api/thumb")

@@ -19,7 +19,7 @@
     pinterest: "Pinterest", snapchat: "Snapchat", threads: "Threads", vimeo: "Vimeo", soundcloud: "SoundCloud", twitch: "Twitch",
     linkedin: "LinkedIn", tumblr: "Tumblr", dailymotion: "Dailymotion", bilibili: "Bilibili", web: "Web" };
 
-  let data = null, quality = null, picked = new Set();
+  let data = null, quality = null, picked = new Set(), lookup = 0, busyUrl = "";
 
   const brand = (p, size) => p && p !== "web"
     ? `<span class="brand" style="--m:url(brands/${p}.svg)${size ? `;width:${size}px;height:${size}px` : ""}"></span>`
@@ -69,17 +69,26 @@
     e.preventDefault();
     const url = findUrl(input.value.trim());
     if (!url) return showErr("That doesn't look like a link. Copy the post's link and paste it again.");
+    if (url === busyUrl) return; // paste + tap both fire: run the lookup once
+    const mine = ++lookup; busyUrl = url;
     err.hidden = true; dlErr.hidden = true; result.hidden = true;
     goBtn.disabled = true; goBtn.classList.add("loading"); goBtn.querySelector("span").textContent = "Finding";
     try {
       const r = await fetch("api/info", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
-      const j = await r.json();
-      if (!r.ok) throw new Error(j.detail || "Couldn't read that link.");
+      let j = {};
+      try { j = await r.json(); } catch {}
+      if (mine !== lookup) return; // a newer link was pasted meanwhile
+      if (!r.ok) throw new Error(j.detail || (r.status === 504 ? "That took too long. Try again." : "Couldn't read that link."));
+      err.hidden = true;
       render(j);
     } catch (ex) {
+      if (mine !== lookup) return;
       showErr(ex.message === "Failed to fetch" ? "No connection to the server. Check your internet and try again." : ex.message);
     } finally {
-      goBtn.disabled = false; goBtn.classList.remove("loading"); goBtn.querySelector("span").textContent = "Find it";
+      if (mine === lookup) {
+        busyUrl = "";
+        goBtn.disabled = false; goBtn.classList.remove("loading"); goBtn.querySelector("span").textContent = "Find it";
+      }
     }
   });
 
@@ -183,7 +192,7 @@
     dlLabel.innerHTML = `<i class="ph ph-hourglass-medium"></i>Getting it ready`;
     try {
       const r = await fetch(`api/download?${q}`);
-      if (!r.ok) { let m = "Download failed. Try again."; try { m = (await r.json()).detail || m; } catch {} throw new Error(m); }
+      if (!r.ok) { let m = r.status === 504 ? "That file took too long for the server. Pick a lower quality." : "Download failed. Try again."; try { m = (await r.json()).detail || m; } catch {} throw new Error(m); }
       const total = +r.headers.get("Content-Length") || 0;
       const cd = r.headers.get("Content-Disposition") || "";
       const fname = decodeURIComponent((cd.match(/filename\*=utf-8''([^;]+)/i) || cd.match(/filename="?([^";]+)"?/i) || [, "get-it"])[1]);
