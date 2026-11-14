@@ -12,9 +12,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
+from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from urllib.parse import urlparse
+
+import http.cookiejar
+import urllib.request
 
 import httpx
 import yt_dlp
@@ -128,13 +133,13 @@ def ydl_opts(**extra) -> dict:
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
-        "socket_timeout": 20,
+        "socket_timeout": 12,
         "max_filesize": MAX_FILESIZE,
         # speed: pull HLS/DASH fragments in parallel, big buffers, no throttled single stream
         "concurrent_fragment_downloads": 16,
         "http_chunk_size": 10 * 1024 * 1024,
         "buffersize": 1024 * 1024,
-        "retries": 3,
+        "retries": 2,
         "fragment_retries": 3,
     }
     if COOKIES and Path(COOKIES).exists():
@@ -147,19 +152,45 @@ def ydl_opts(**extra) -> dict:
     return opts
 
 
-def friendly(err: Exception, downloading: bool = False) -> str:
+def _strip_ytdlp_footer(msg: str) -> str:
+    """yt-dlp appends a generic footer to almost every error
+    ("Confirm you are on the latest version using yt-dlp -U", "You can get more
+    help at ..."). It is not part of the real failure and must never be matched
+    on — it used to make every failure on every site look like a YouTube
+    bot-check."""
+    for marker in ("; please report this issue", "you can get more help",
+                   "confirm you are on the latest version"):
+        if marker in msg:
+            msg = msg.split(marker, 1)[0]
+    return msg
+
+
+def friendly(err: Exception, downloading: bool = False, platform: str = "web") -> str:
     print(f"[get-it] {type(err).__name__}: {err}", flush=True)  # real reason shows in the host's logs
-    msg = str(err).lower()
-    if "not a bot" in msg or "confirm you" in msg or "failed to extract any player response" in msg or "po token" in msg:
-        return "YouTube is blocking the server right now, not your video. Try again in a minute."
-    if "private video" in msg or "this account is private" in msg or "private" in msg and "youtube" not in msg or "rate-limit" in msg or ("login" in msg and "youtube" not in msg):
+    msg = _strip_ytdlp_footer(str(err).lower())
+    # A post is private only when the extractor says so in its own words.
+    # A rate-limit, a bot-check or a login wall is a server block, not a private post.
+    if ("private video" in msg or "this video is private" in msg or "this account is private" in msg
+            or "post is private" in msg or "private account" in msg or "only visible to" in msg):
         return "This post is private or needs a login to view."
+    if "rate limit" in msg or "rate-limit" in msg or "too many requests" in msg or "429" in msg:
+        return "The platform is rate-limiting the server right now. Wait a minute and try again."
+    if ("not a bot" in msg or "confirm you're not a bot" in msg or "confirm you are not a bot" in msg
+            or "failed to extract any player response" in msg
+            or "po token" in msg or "the page needs to be reloaded" in msg or "no video formats found" in msg):
+        if platform == "youtube":
+            return "YouTube is blocking the server right now, not your video. Try again in a minute."
+        return "The platform is blocking the server right now, not your video. Try again in a minute."
+    if "login" in msg or "sign in" in msg or "log in" in msg:
+        return "This post needs a login to view."
     if "unsupported url" in msg:
         return "This site isn't supported yet."
-    if "404" in msg or "not found" in msg or "unavailable" in msg or "removed" in msg:
+    if "404" in msg or "not found" in msg or "unavailable" in msg or "removed" in msg or "does not exist" in msg:
         return "This post is gone or the link has expired. Copy it again."
     if "max_filesize" in msg or "larger than" in msg:
         return "That file is too big for this server."
+    if "timed out" in msg or "timeout" in msg or "connection" in msg:
+        return "The platform took too long to respond. Try again in a minute."
     if downloading:
         return "Couldn't download this one. Try another quality, or try again in a minute."
     return "Couldn't read that link. Check it opens in your browser, then try again."
@@ -241,28 +272,81 @@ _yt_winner: list | None = None
 
 
 def variants(url: str) -> list[dict]:
-    if platform_of(url) != "youtube":
-        return [{}]
-    order = ([_yt_winner] if _yt_winner else []) + [c for c in YT_CLIENTS if c != _yt_winner]
-    return [{} if c is None else {"extractor_args": {"youtube": {"player_client": c}}} for c in order]
+    """Try the site's no-login API first, then fall back to the heavier ones."""
+    plat = platform_of(url)
+    if plat == "x":
+        return [
+            {"extractor_args": {"twitter": {"api": ["syndication"]}}},  # no guest token, fast
+            {"extractor_args": {"twitter": {"api": ["graphql"]}}},       # needs a guest token, slower
+            {},
+        ]
+    if plat == "youtube":
+        order = ([_yt_winner] if _yt_winner else []) + [c for c in YT_CLIENTS if c != _yt_winner]
+        return [{} if c is None else {"extractor_args": {"youtube": {"player_client": c}}} for c in order]
+    return [{}]
 
 
 def blocked(e: Exception) -> bool:
-    m = str(e).lower()
-    return any(k in m for k in ("not a bot", "confirm you", "player response", "po token", "sign in", "403", "429",
-                                "requested format is not available", "unavailable"))
+    """True when the failure is a platform block or a flaky extraction — worth
+    retrying with another player client / API instead of giving up. Terminal
+    errors (deleted video, unsupported URL) are NOT in here so they fail fast."""
+    msg = _strip_ytdlp_footer(str(e).lower())
+    return any(k in msg for k in (
+        "not a bot", "confirm you", "player response", "po token", "sign in", "log in", "login",
+        "403", "429", "rate limit", "rate-limit", "requested format is not available",
+        "the page needs to be reloaded", "no video formats found", "no formats",
+        "timed out", "timeout", "unable to extract", "failed to extract",
+        "connection", "reset by peer", "temporary", "try again", "server returned",
+    ))
 
 
-def extract(url: str, **opts):
-    """extract_info with YouTube client fallback. Returns (info, ydl, variant)."""
+_INFO_CACHE: dict[tuple, tuple[float, dict, dict]] = {}
+_INFO_CACHE_TTL = 300  # seconds; media URLs stay signed far longer than this
+_INFO_CACHE_MAX = 64
+
+
+def _cookie_header(url: str) -> str:
+    """Cookie header for a URL, read straight from the cookies file. Used on
+    cache hits, where there is no live YoutubeDL instance to ask."""
+    if not (COOKIES and Path(COOKIES).exists()):
+        return ""
+    try:
+        jar = http.cookiejar.MozillaCookieJar(COOKIES)
+        jar.load(ignore_discard=True, ignore_expires=True)
+        req = urllib.request.Request(url)
+        jar.add_cookie_header(req)
+        return req.get_header("Cookie") or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def extract(url: str, budget_s: float = 75, **opts):
+    """extract_info with platform fallback. Returns (info, ydl, variant).
+
+    A 5-minute in-memory cache means the download re-uses the probe the info
+    screen just did, instead of re-extracting (and re-hitting each platform's
+    flaky path) two more times. On a cache hit ydl is None — callers that need
+    cookies must read them from the cookies file themselves."""
     global _yt_winner
     last: Exception | None = None
+    start = time.monotonic()
     for v in variants(url):
+        if time.monotonic() - start > budget_s:
+            break
+        # the cache is keyed on the caller's options too: a probe (playlistend=50)
+        # and a plan (noplaylist) for the same URL can legitimately differ
+        key = (url, json.dumps(v, sort_keys=True), json.dumps(opts, sort_keys=True, default=str))
+        hit = _INFO_CACHE.get(key)
+        if hit and time.monotonic() - hit[0] < _INFO_CACHE_TTL:
+            return hit[1], None, hit[2]
         ydl = yt_dlp.YoutubeDL(ydl_opts(**opts, **v))
         try:
             info = ydl.extract_info(url, download=False)
-            if v:
+            if v and "youtube" in v.get("extractor_args", {}):
                 _yt_winner = v["extractor_args"]["youtube"]["player_client"]
+            if len(_INFO_CACHE) >= _INFO_CACHE_MAX:
+                _INFO_CACHE.pop(next(iter(_INFO_CACHE)))
+            _INFO_CACHE[key] = (time.monotonic(), info, v)
             return info, ydl, v
         except Exception as e:  # noqa: BLE001
             last = e
@@ -272,8 +356,10 @@ def extract(url: str, **opts):
 
 
 def probe_ytdlp(url: str) -> dict:
-    info, ydl, _ = extract(url, skip_download=True, extract_flat=False, playlistend=50)
-    info = ydl.sanitize_info(info)
+    info, _ydl, _ = extract(url, skip_download=True, extract_flat=False, playlistend=50)
+    # sanitize_info is a static method that returns a fresh dict, so it is safe
+    # on the cached raw info (the cache keeps the raw copy for plan()).
+    info = yt_dlp.YoutubeDL.sanitize_info(info)
     entries = [e for e in (info.get("entries") or []) if e]
     items = [item_from_info(e) for e in entries] if entries else [item_from_info(info)]
     return {
@@ -298,7 +384,7 @@ def gdl_base() -> list[str]:
 
 
 def probe_gallery(url: str) -> dict:
-    r = subprocess.run(gdl_base() + ["--dump-json", url], capture_output=True, text=True, timeout=60)
+    r = subprocess.run(gdl_base() + ["--dump-json", url], capture_output=True, text=True, timeout=30)
     if r.returncode != 0 or not r.stdout.strip():
         raise RuntimeError(r.stderr or "gallery-dl found nothing")
     data = json.loads(r.stdout)
@@ -329,17 +415,48 @@ def probe_gallery(url: str) -> dict:
 @app.post("/api/info")
 def info(link: Link):
     url = clean_url(link.url)
-    first_err: Exception | None = None
+    platform = platform_of(url)
+    # Both engines run at once. yt-dlp's format list is what powers the quality
+    # picker, so it gets a short head start (~8s — syndication and the usual
+    # clients answer in 2-6s). If it is still stuck after that and gallery-dl
+    # already has media, take gallery's answer instead of waiting 20-60s.
+    # (Sequentially, a slow or dead engine used to cost 20-60s before the
+    # other one even started.)
+    results: dict[str, dict | Exception] = {}
+
+    def run(name: str, fn):
+        try:
+            results[name] = fn(url)
+        except Exception as e:  # noqa: BLE001
+            results[name] = e
+
+    def has_media(name: str) -> bool:
+        r = results.get(name)
+        return isinstance(r, dict) and any(i["kind"] in ("video", "audio") for i in r.get("items", []))
+
+    # No `with` block: exiting one would wait for the slow engine. The
+    # straggler keeps running in its own thread and finishes on its own.
+    ex = ThreadPoolExecutor(max_workers=2)
+    ytdlp_fut = ex.submit(run, "ytdlp", probe_ytdlp)
+    gallery_fut = ex.submit(run, "gallery", probe_gallery)
     try:
-        data = probe_ytdlp(url)
-        if any(i["kind"] in ("video", "audio") for i in data["items"]):
-            return {"url": url, "platform": platform_of(url), **data}
-    except Exception as e:  # noqa: BLE001
-        first_err = e
-    try:
-        return {"url": url, "platform": platform_of(url), **probe_gallery(url)}
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(422, friendly(first_err or e))
+        done, _ = wait([ytdlp_fut], timeout=8)
+        if ytdlp_fut not in done and not (gallery_fut.done() and has_media("gallery")):
+            wait([ytdlp_fut], return_when=ALL_COMPLETED)
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+
+    data = results.get("ytdlp")
+    if not (isinstance(data, dict) and has_media("ytdlp")):
+        # yt-dlp gave no media: give gallery-dl a chance to finish, then use it.
+        if not gallery_fut.done():
+            wait([gallery_fut], timeout=30)
+        data = results.get("gallery")
+    if isinstance(data, dict):
+        return {"url": url, "platform": platform, **data}
+    err = results.get("ytdlp") if isinstance(results.get("ytdlp"), Exception) else results.get("gallery")
+    raise HTTPException(422, friendly(err if isinstance(err, Exception) else RuntimeError("no downloadable media"),
+                                platform=platform))
 
 
 def safe_name(s: str, fallback: str = "get-it") -> str:
@@ -398,12 +515,24 @@ def codec_rank(f: dict) -> int:
     return 2 if v.startswith(("avc", "h264")) else 1 if v.startswith(("hev", "h265", "hvc", "vp9", "vp09")) else 0
 
 
-def plan(url: str, quality: str) -> dict:
+def plan(url: str, quality: str, items: str = "") -> dict:
     """Read the post once and decide the fastest way to deliver the asked quality.
     direct: one ready-made file with sound and picture -> relay it straight from the CDN.
-    spec:   exact format ids for yt-dlp to fetch (in parallel) and merge."""
-    info, ydl, variant = extract(url, skip_download=True, noplaylist=True)
-    if not info or info.get("_type") == "playlist" or info.get("entries"):
+    spec:   exact format ids for yt-dlp to fetch (in parallel) and merge.
+    Uses the same options as the info probe so the download re-uses the probe's
+    cached extraction instead of re-extracting."""
+    info, ydl, variant = extract(url, skip_download=True, extract_flat=False, playlistend=50)
+    entries = [e for e in (info.get("entries") or []) if e]
+    if entries:
+        # A post with several files: the relay can only serve one. If exactly
+        # one item was picked, serve that one; a lone entry serves itself.
+        if len(entries) == 1 and not items:
+            info = entries[0]
+        elif items and "," not in items and items.strip().isdigit() and 1 <= int(items.strip()) <= len(entries):
+            info = entries[int(items.strip()) - 1]
+        else:
+            return {}
+    if not info:
         return {}
     formats = [f for f in (info.get("formats") or [info]) if f.get("url")]
     if quality == "audio":
@@ -419,7 +548,8 @@ def plan(url: str, quality: str) -> dict:
         if not want or short_side(best) >= want * 0.85:
             headers = dict(best.get("http_headers") or info.get("http_headers") or {})
             try:  # CDNs like TikTok's only serve the file to the session that read the post
-                cookie = ydl.cookiejar.get_cookie_header(best["url"])
+                cookie = (ydl.cookiejar.get_cookie_header(best["url"]) if ydl
+                          else _cookie_header(best["url"]))
                 if cookie:
                     headers["Cookie"] = cookie
             except Exception:  # noqa: BLE001
@@ -444,14 +574,31 @@ def plan(url: str, quality: str) -> dict:
 
 
 async def relay(src: dict, name: str):
-    client = httpx.AsyncClient(timeout=httpx.Timeout(30, read=60), follow_redirects=True, http2=False,
-                               limits=httpx.Limits(max_connections=4))
-    req = client.build_request("GET", src["url"], headers=src["headers"])
-    upstream = await client.send(req, stream=True)
-    if upstream.status_code >= 400:
-        print(f"[get-it] relay got {upstream.status_code}, falling back", flush=True)
+    # trust_env=False: the host's proxy env vars must never break the relay.
+    # httpx parses NO_PROXY entries as URL patterns, and a bracketed IPv6 entry
+    # like [::1] makes client construction raise "Invalid port: ':1]'". The
+    # app's own PROXY setting (if any) is passed explicitly instead.
+    upstream = None
+    client = None
+    for attempt in range(2):
+        client = httpx.AsyncClient(timeout=httpx.Timeout(10, read=90), follow_redirects=True, http2=False,
+                                   trust_env=False, proxy=PROXY or None,
+                                   limits=httpx.Limits(max_connections=4))
+        req = client.build_request("GET", src["url"], headers=src["headers"])
+        upstream = await client.send(req, stream=True)
+        if upstream.status_code < 400:
+            break
+        # A 403/429 can mean the CDN saw a different egress IP than the one that
+        # read the post (hosts with rotating egress IPs). One retry on a fresh
+        # connection is cheap and sometimes lands on the right one.
+        retry = attempt == 0 and upstream.status_code in (403, 429)
+        print(f"[get-it] relay got {upstream.status_code}, {'retrying once' if retry else 'falling back'}", flush=True)
         await upstream.aclose()
         await client.aclose()
+        upstream, client = None, None
+        if not retry:
+            return None
+    if upstream is None:  # both attempts were refused
         return None
 
     async def body():
@@ -480,9 +627,10 @@ async def download(
 ):
     url = clean_url(url)
     spec = None
-    if engine == "ytdlp" and not items:
+    variant = None
+    if engine == "ytdlp":
         try:
-            p = await run_in_threadpool(plan, url, quality)
+            p = await run_in_threadpool(plan, url, quality, items)
         except Exception as e:  # noqa: BLE001
             print(f"[get-it] plan failed: {e}", flush=True)
             p = {}
@@ -494,7 +642,8 @@ async def download(
             except Exception as e:  # noqa: BLE001
                 print(f"[get-it] relay failed, falling back: {e}", flush=True)
         spec = p.get("spec")
-    return await run_in_threadpool(download_saved, url, quality, engine, items, name, spec, (p or {}).get("variant") if engine == "ytdlp" and not items else None)
+        variant = p.get("variant")
+    return await run_in_threadpool(download_saved, url, quality, engine, items, name, spec, variant)
 
 
 def download_saved(
@@ -530,7 +679,8 @@ def download_saved(
                 h = int(quality) if quality.isdigit() else 4320
                 extra["format"] = f"{spec}/bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"
                 extra["merge_output_format"] = "mp4"
-                extra["noplaylist"] = True
+                if not items:  # a picked item needs the playlist selection to apply
+                    extra["noplaylist"] = True
             elif FFMPEG:
                 h = int(quality) if quality.isdigit() else 4320
                 extra["format"] = f"bv*[height<={h}][vcodec^=avc1]+ba[ext=m4a]/bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"
@@ -539,7 +689,10 @@ def download_saved(
                 # no ffmpeg: only single files that already carry sound and picture
                 h = int(quality) if quality.isdigit() else 4320
                 extra["format"] = f"b[height<={h}][acodec!=none][vcodec!=none]/b[acodec!=none][vcodec!=none]/b"
-            tries = [variant] if variant is not None else variants(url)
+            # A recorded winning variant is tried first, but a flaky win must
+            # not doom the download: fall through the rest of the variants.
+            tries = ([variant] + [v for v in variants(url) if v != variant]) \
+                if variant is not None else variants(url)
             for i, v in enumerate(tries):
                 try:
                     with yt_dlp.YoutubeDL(ydl_opts(**extra, **(v or {}))) as ydl:
@@ -557,7 +710,7 @@ def download_saved(
         raise
     except Exception as e:  # noqa: BLE001
         shutil.rmtree(workdir, ignore_errors=True)
-        raise HTTPException(422, friendly(e, downloading=True))
+        raise HTTPException(422, friendly(e, downloading=True, platform=platform_of(url)))
 
 
 @app.get("/api/thumb")
@@ -565,7 +718,8 @@ async def thumb(u: str):
     """Proxy thumbnails so CDNs that block cross-site images (Instagram, TikTok) still show."""
     if not u.startswith("https://"):
         raise HTTPException(400)
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True, trust_env=False,
+                                 proxy=PROXY or None) as c:
         r = await c.get(u, headers={"User-Agent": "Mozilla/5.0"})
     if r.status_code != 200 or not r.headers.get("content-type", "").startswith("image/"):
         raise HTTPException(404)

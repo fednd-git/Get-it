@@ -74,7 +74,13 @@
     err.hidden = true; dlErr.hidden = true; result.hidden = true;
     goBtn.disabled = true; goBtn.classList.add("loading"); goBtn.querySelector("span").textContent = "Finding";
     try {
-      const r = await fetch("api/info", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
+      // the server answers in a few seconds now; 90s is a hard stop, not a wait target
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 90000);
+      let r;
+      try {
+        r = await fetch("api/info", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }), signal: ctl.signal });
+      } finally { clearTimeout(timer); }
       let j = {};
       try { j = await r.json(); } catch {}
       if (mine !== lookup) return; // a newer link was pasted meanwhile
@@ -83,7 +89,7 @@
       render(j);
     } catch (ex) {
       if (mine !== lookup) return;
-      showErr(ex.message === "Failed to fetch" ? "No connection to the server. Check your internet and try again." : ex.message);
+      showErr(ex.name === "AbortError" ? "That took too long. Try again in a minute." : ex.message === "Failed to fetch" ? "No connection to the server. Check your internet and try again." : ex.message);
     } finally {
       if (mine === lookup) {
         busyUrl = "";
