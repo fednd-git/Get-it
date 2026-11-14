@@ -30,23 +30,25 @@ docker run -p 8000:8000 get-it
 
 Then on your phone, open the link in Chrome, tap ⋮ and **Install app**. Get-it shows up in Android's Share menu.
 
-## Private posts and blocked sites
+## YouTube, private posts and blocked sites
 
-Some posts (private accounts, age-gated or login-only content) need a signed-in session. Export a `cookies.txt` from your browser (Netscape format) for that site, add it to the server as a secret file, and set:
+YouTube and Instagram sometimes refuse requests from cloud servers (Vercel, Render) with a "confirm you're not a bot" check, even for public videos. Get-it already retries through several YouTube app clients. If a site keeps refusing:
 
-```
-COOKIES_FILE=/etc/secrets/cookies.txt
-```
+1. Sign in to that site in a desktop browser with a **spare** account.
+2. Export its cookies as `cookies.txt` (Netscape format) with an extension like "Get cookies.txt LOCALLY".
+3. On Vercel: Project, Settings, Environment Variables, add `COOKIES_TXT` with the file's contents (or base64 of it). Redeploy.
 
-Use a spare account for this, not your main one.
+A residential proxy in `PROXY` also gets past cloud-IP blocks.
 
 ## Settings
 
 | Variable | Default | What it does |
 |---|---|---|
-| `COOKIES_FILE` | none | Path to a cookies.txt for login-only posts |
+| `COOKIES_TXT` | none | Contents of a cookies.txt (raw or base64), for bot checks and login-only posts |
+| `COOKIES_FILE` | none | Path to a cookies.txt instead (Docker hosts) |
+| `PROXY` | none | http/https/socks proxy for sites that block cloud servers |
 | `MAX_FILESIZE_MB` | 500 | Biggest file the server will fetch |
-| `PORT` | 8000 | Port to listen on |
+| `PORT` | 8000 | Port to listen on (Docker) |
 
 ## How it works
 

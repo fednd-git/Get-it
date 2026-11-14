@@ -27,7 +27,32 @@ from starlette.background import BackgroundTask
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
-COOKIES = os.environ.get("COOKIES_FILE")  # optional Netscape cookies.txt for logged-in-only posts
+PROXY = os.environ.get("PROXY")  # optional http(s)/socks proxy, e.g. a residential one, for sites that block cloud servers
+
+
+def _cookies_path() -> str | None:
+    """COOKIES_FILE = path to a Netscape cookies.txt. COOKIES_TXT = the file's contents (raw or base64),
+    handy on Vercel where you can only set environment variables."""
+    path = os.environ.get("COOKIES_FILE")
+    if path and Path(path).exists():
+        return path
+    raw = os.environ.get("COOKIES_TXT")
+    if not raw:
+        return None
+    if "\t" not in raw:
+        import base64
+
+        try:
+            raw = base64.b64decode(raw).decode()
+        except Exception:  # noqa: BLE001
+            return None
+    dst = os.path.join(os.environ.get("TMPDIR") or "/tmp", "getit-cookies.txt")
+    with open(dst, "w") as f:
+        f.write(raw if raw.startswith("# ") else "# Netscape HTTP Cookie File\n" + raw)
+    return dst
+
+
+COOKIES = _cookies_path()
 MAX_FILESIZE = int(os.environ.get("MAX_FILESIZE_MB", "500")) * 1024 * 1024
 
 app = FastAPI(title="Get-it", docs_url=None, redoc_url=None)
@@ -114,6 +139,8 @@ def ydl_opts(**extra) -> dict:
     }
     if COOKIES and Path(COOKIES).exists():
         opts["cookiefile"] = COOKIES
+    if PROXY:
+        opts["proxy"] = PROXY
     if FFMPEG:
         opts["ffmpeg_location"] = FFMPEG
     opts.update(extra)
@@ -123,7 +150,9 @@ def ydl_opts(**extra) -> dict:
 def friendly(err: Exception) -> str:
     print(f"[get-it] {type(err).__name__}: {err}", flush=True)  # real reason shows in the host's logs
     msg = str(err).lower()
-    if "private" in msg or "login" in msg or "cookies" in msg or "rate-limit" in msg:
+    if "not a bot" in msg or "confirm you" in msg or "failed to extract any player response" in msg or "po token" in msg:
+        return "YouTube is blocking the server right now, not your video. Try again in a minute."
+    if "private video" in msg or "this account is private" in msg or "private" in msg and "youtube" not in msg or "rate-limit" in msg or ("login" in msg and "youtube" not in msg):
         return "This post is private or needs a login to view."
     if "unsupported url" in msg:
         return "This site isn't supported yet."
@@ -193,9 +222,46 @@ def item_from_info(info: dict) -> dict:
     }
 
 
+# YouTube often refuses cloud servers with its default web client. Other YouTube apps' clients
+# (TV, Safari, Android VR, mobile web) are checked differently, so we try them in turn and
+# remember the one that last worked.
+YT_CLIENTS = [None, ["tv", "web_safari"], ["android_vr"], ["mweb"], ["tv_simply"], ["web_embedded"], ["ios"]]
+_yt_winner: list | None = None
+
+
+def variants(url: str) -> list[dict]:
+    if platform_of(url) != "youtube":
+        return [{}]
+    order = ([_yt_winner] if _yt_winner else []) + [c for c in YT_CLIENTS if c != _yt_winner]
+    return [{} if c is None else {"extractor_args": {"youtube": {"player_client": c}}} for c in order]
+
+
+def blocked(e: Exception) -> bool:
+    m = str(e).lower()
+    return any(k in m for k in ("not a bot", "confirm you", "player response", "po token", "sign in", "403", "429",
+                                "requested format is not available", "unavailable"))
+
+
+def extract(url: str, **opts):
+    """extract_info with YouTube client fallback. Returns (info, ydl, variant)."""
+    global _yt_winner
+    last: Exception | None = None
+    for v in variants(url):
+        ydl = yt_dlp.YoutubeDL(ydl_opts(**opts, **v))
+        try:
+            info = ydl.extract_info(url, download=False)
+            if v:
+                _yt_winner = v["extractor_args"]["youtube"]["player_client"]
+            return info, ydl, v
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if not blocked(e):
+                break
+    raise last  # type: ignore[misc]
+
+
 def probe_ytdlp(url: str) -> dict:
-    with yt_dlp.YoutubeDL(ydl_opts(skip_download=True, extract_flat=False, playlistend=50)) as ydl:
-        info = ydl.extract_info(url, download=False)
+    info, ydl, _ = extract(url, skip_download=True, extract_flat=False, playlistend=50)
     info = ydl.sanitize_info(info)
     entries = [e for e in (info.get("entries") or []) if e]
     items = [item_from_info(e) for e in entries] if entries else [item_from_info(info)]
@@ -215,6 +281,8 @@ def gdl_base() -> list[str]:
     cmd = [sys.executable, "-m", "gallery_dl", "--quiet"]
     if COOKIES and Path(COOKIES).exists():
         cmd += ["--cookies", COOKIES]
+    if PROXY:
+        cmd += ["--proxy", PROXY]
     return cmd
 
 
@@ -323,8 +391,7 @@ def plan(url: str, quality: str) -> dict:
     """Read the post once and decide the fastest way to deliver the asked quality.
     direct: one ready-made file with sound and picture -> relay it straight from the CDN.
     spec:   exact format ids for yt-dlp to fetch (in parallel) and merge."""
-    with yt_dlp.YoutubeDL(ydl_opts(skip_download=True, noplaylist=True)) as ydl:
-        info = ydl.extract_info(url, download=False)
+    info, ydl, variant = extract(url, skip_download=True, noplaylist=True)
     if not info or info.get("_type") == "playlist" or info.get("entries"):
         return {}
     formats = [f for f in (info.get("formats") or [info]) if f.get("url")]
@@ -357,12 +424,12 @@ def plan(url: str, quality: str) -> dict:
         v = max(vids, key=lambda f: (short_side(f), codec_rank(f), f.get("tbr") or 0))
         a = max(auds, key=lambda f: ((f.get("ext") == "m4a"), f.get("abr") or f.get("tbr") or 0))
         if has_a(v):
-            return {"spec": v["format_id"]}
-        return {"spec": f"{v['format_id']}+{a['format_id']}"}
+            return {"spec": v["format_id"], "variant": variant}
+        return {"spec": f"{v['format_id']}+{a['format_id']}", "variant": variant}
     if vids:
         v = max(vids, key=lambda f: (has_a(f), short_side(f), codec_rank(f)))
-        return {"spec": v["format_id"]}
-    return {}
+        return {"spec": v["format_id"], "variant": variant}
+    return {"variant": variant}
 
 
 async def relay(src: dict, name: str):
@@ -416,7 +483,7 @@ async def download(
             except Exception as e:  # noqa: BLE001
                 print(f"[get-it] relay failed, falling back: {e}", flush=True)
         spec = p.get("spec")
-    return await run_in_threadpool(download_saved, url, quality, engine, items, name, spec)
+    return await run_in_threadpool(download_saved, url, quality, engine, items, name, spec, (p or {}).get("variant") if engine == "ytdlp" and not items else None)
 
 
 def download_saved(
@@ -426,6 +493,7 @@ def download_saved(
     items: str = Query("", description="comma list of 1-based item numbers; empty = all"),
     name: str = "get-it",
     spec: str | None = None,
+    variant: dict | None = None,
 ):
     workdir = tempfile.mkdtemp(prefix="getit-", dir=TMP)
     try:
@@ -459,8 +527,15 @@ def download_saved(
                 # no ffmpeg: only single files that already carry sound and picture
                 h = int(quality) if quality.isdigit() else 4320
                 extra["format"] = f"b[height<={h}][acodec!=none][vcodec!=none]/b[acodec!=none][vcodec!=none]/b"
-            with yt_dlp.YoutubeDL(ydl_opts(**extra)) as ydl:
-                ydl.download([url])
+            tries = [variant] if variant is not None else variants(url)
+            for i, v in enumerate(tries):
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts(**extra, **(v or {}))) as ydl:
+                        ydl.download([url])
+                    break
+                except Exception as e:  # noqa: BLE001
+                    if i == len(tries) - 1 or not blocked(e):
+                        raise
         paths = files_in(workdir)
         if not paths:
             raise RuntimeError("nothing downloaded")
