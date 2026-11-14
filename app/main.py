@@ -170,13 +170,12 @@ def _strip_ytdlp_footer(msg: str) -> str:
 
 
 def _meta_login_msg(platform: str) -> str:
-    """The one fix for every Meta failure from a cloud server: Meta serves
-    nothing to a browser it doesn't recognise, so the app needs the user's
-    own logged-in session (cookies)."""
+    """Meta serves nothing to a server it doesn't recognise. The fix (COOKIES_TXT) is for
+    the owner, so it goes to the logs; the person using the app gets a plain sentence."""
     name = "Facebook" if platform == "facebook" else "Instagram"
-    return (f"{name} only shows this to logged-in browsers from this server. Fix: export your browser "
-            "cookies as cookies.txt and add them as COOKIES_TXT in Vercel "
-            "(Project → Settings → Environment Variables), then redeploy.")
+    print(f"[get-it] hint: {name} refused the server. Add COOKIES_TXT (cookies.txt from a logged-in browser) "
+          "in Vercel env vars and redeploy.", flush=True)
+    return f"{name} won't share this one right now. It may be private, or {name} is busy. Try again in a bit."
 
 
 def friendly(err: Exception, downloading: bool = False, platform: str = "web") -> str:
@@ -193,8 +192,8 @@ def friendly(err: Exception, downloading: bool = False, platform: str = "web") -
             or "failed to extract any player response" in msg
             or "po token" in msg or "the page needs to be reloaded" in msg or "no video formats found" in msg):
         if platform == "youtube":
-            return ("YouTube is blocking the server right now, not your video. "
-                    "Adding your cookies as COOKIES_TXT in Vercel usually fixes it — or try again in a minute.")
+            print("[get-it] hint: YouTube bot-check. Add COOKIES_TXT or PO_TOKEN in Vercel env vars.", flush=True)
+            return "YouTube isn't letting Get-it in right now. Your video is fine. Try again in a bit."
         if platform in ("facebook", "instagram"):
             return _meta_login_msg(platform)
         return "The platform is blocking the server right now, not your video. Try again in a minute."
@@ -761,6 +760,21 @@ def download_saved(
     except Exception as e:  # noqa: BLE001
         shutil.rmtree(workdir, ignore_errors=True)
         raise HTTPException(422, friendly(e, downloading=True, platform=platform_of(url)))
+
+
+@app.get("/api/formats")
+def formats(url: str):
+    """What the server sees for a link: lets the owner check a failing post from any browser."""
+    url = clean_url(url)
+    try:
+        info, _, v = extract(url, budget_s=40, skip_download=True, extract_flat=False, playlistend=50)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": _strip_ytdlp_footer(str(e))[:500]}
+    entries = [e for e in (info.get("entries") or []) if e] or [info]
+    return {"ok": True, "variant": v, "items": [{
+        "title": e.get("title"), "duration": e.get("duration"),
+        "formats": [{k: f.get(k) for k in ("format_id", "protocol", "ext", "width", "height", "vcodec", "acodec")}
+                    for f in (e.get("formats") or [e])]} for e in entries]}
 
 
 @app.get("/api/thumb")
