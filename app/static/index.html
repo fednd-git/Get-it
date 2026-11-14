@@ -3,14 +3,15 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#0d1112">
+<meta name="theme-color" content="#e7e8e8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0f1010" media="(prefers-color-scheme: dark)">
 <meta name="description" content="Paste a link from Instagram, TikTok, Facebook, X and more. Get the video or image.">
 <title>Get-it</title>
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Host+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/regular/style.css">
 <link rel="stylesheet" href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/fill/style.css">
 <link rel="stylesheet" href="style.css">
@@ -67,6 +68,7 @@
       <span class="fill" id="fill"></span>
       <span class="lbl" id="dlLabel">Download</span>
     </button>
+    <p class="err dlerr" id="dlErr" role="alert" hidden></p>
   </section>
 
   <section class="recent" id="recentWrap" hidden>

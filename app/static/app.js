@@ -45,10 +45,11 @@
     else { badge.innerHTML = `<i class="ph ph-link-simple"></i>`; badge.classList.remove("on"); }
   }
 
-  function showErr(msg) {
-    err.innerHTML = `<i class="ph ph-warning-circle"></i><span></span>`;
-    err.querySelector("span").textContent = msg;
-    err.hidden = false;
+  const dlErr = $("dlErr");
+  function showErr(msg, where = err) {
+    where.innerHTML = `<i class="ph ph-warning-circle"></i><span></span>`;
+    where.querySelector("span").textContent = msg;
+    where.hidden = false;
   }
 
   input.addEventListener("input", () => { err.hidden = true; setBadge(); });
@@ -68,7 +69,7 @@
     e.preventDefault();
     const url = findUrl(input.value.trim());
     if (!url) return showErr("That doesn't look like a link. Copy the post's link and paste it again.");
-    err.hidden = true; result.hidden = true;
+    err.hidden = true; dlErr.hidden = true; result.hidden = true;
     goBtn.disabled = true; goBtn.classList.add("loading"); goBtn.querySelector("span").textContent = "Finding";
     try {
       const r = await fetch("api/info", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
@@ -178,7 +179,7 @@
     const sel = items.length > 1 ? [...picked].sort((a, b) => a - b).map((i) => i + 1).join(",") : "";
     const name = (data.title || data.author || "get-it").slice(0, 50);
     const q = new URLSearchParams({ url: data.url, quality: items.length > 1 ? (items.some(i=>i.kind==="video") ? "1080" : "best") : quality, engine: data.engine, items: sel, name });
-    dl.classList.add("busy"); fill.style.width = "0";
+    dl.classList.add("busy"); fill.style.width = "0"; dlErr.hidden = true;
     dlLabel.innerHTML = `<i class="ph ph-hourglass-medium"></i>Getting it ready`;
     try {
       const r = await fetch(`api/download?${q}`);
@@ -202,7 +203,7 @@
       setTimeout(() => { dl.classList.remove("done"); updatePick(); }, 2400);
     } catch (ex) {
       dl.classList.remove("busy"); fill.style.width = "0"; updatePick();
-      showErr(ex.message === "Failed to fetch" ? "Lost the connection mid-download. Try again." : ex.message);
+      showErr(ex.message === "Failed to fetch" ? "Lost the connection mid-download. Try again." : ex.message, dlErr);
     }
   });
 

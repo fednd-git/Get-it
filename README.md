@@ -24,13 +24,11 @@ docker run -p 8000:8000 get-it
 
 ## Put it online (free)
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/fednd-git/Get-it)
+**Vercel** (what Get-it runs on now): import the repo at vercel.com/new. It finds the FastAPI app in `app/main.py`, and `vercel.json` gives downloads up to 5 minutes. ffmpeg comes from the `imageio-ffmpeg` package, so merging HD video and making MP3s work without a system install. Files stream back, so there's no 4.5 MB cap.
 
-1. Tap the button, sign in to Render with GitHub, and confirm. It reads `render.yaml` and builds the Dockerfile.
-2. When it's live, open the `onrender.com` link on your phone.
-3. In Chrome, tap ⋮ then **Add to Home screen** / **Install app**. Now Get-it shows up in Android's Share menu.
+**Render / any Docker host**: [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/fednd-git/Get-it) uses the Dockerfile.
 
-The free plan sleeps after 15 minutes idle, so the first link after a break takes about 30 seconds.
+Then on your phone, open the link in Chrome, tap ⋮ and **Install app**. Get-it shows up in Android's Share menu.
 
 ## Private posts and blocked sites
 

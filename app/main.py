@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 import httpx
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
@@ -30,6 +30,30 @@ COOKIES = os.environ.get("COOKIES_FILE")  # optional Netscape cookies.txt for lo
 MAX_FILESIZE = int(os.environ.get("MAX_FILESIZE_MB", "500")) * 1024 * 1024
 
 app = FastAPI(title="Get-it", docs_url=None, redoc_url=None)
+
+
+def find_ffmpeg() -> str | None:
+    """System ffmpeg (Docker) or the static one bundled by imageio-ffmpeg (Vercel, other serverless hosts)."""
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if not os.access(exe, os.X_OK):  # read-only bundles can drop the exec bit: copy to /tmp
+            dst = os.path.join(os.environ.get("TMPDIR") or "/tmp", "ffmpeg")
+            if not os.path.exists(dst):
+                shutil.copy(exe, dst)
+            os.chmod(dst, 0o755)
+            exe = dst
+        return exe
+    except Exception:  # noqa: BLE001
+        return None
+
+
+FFMPEG = find_ffmpeg()
+TMP = os.environ.get("TMPDIR") or "/tmp"
 
 PLATFORMS = {
     "instagram": ["instagram.com", "instagr.am"],
@@ -83,11 +107,14 @@ def ydl_opts(**extra) -> dict:
     }
     if COOKIES and Path(COOKIES).exists():
         opts["cookiefile"] = COOKIES
+    if FFMPEG:
+        opts["ffmpeg_location"] = FFMPEG
     opts.update(extra)
     return opts
 
 
 def friendly(err: Exception) -> str:
+    print(f"[get-it] {type(err).__name__}: {err}", flush=True)  # real reason shows in the host's logs
     msg = str(err).lower()
     if "private" in msg or "login" in msg or "cookies" in msg or "rate-limit" in msg:
         return "This post is private or needs a login to view."
@@ -224,16 +251,41 @@ def safe_name(s: str, fallback: str = "get-it") -> str:
     return s or fallback
 
 
-def finish(paths: list[Path], workdir: str, base: str) -> FileResponse:
-    cleanup = BackgroundTask(shutil.rmtree, workdir, ignore_errors=True)
+def stream_file(path: Path, workdir: str, filename: str, media_type: str) -> StreamingResponse:
+    """Stream in chunks: serverless hosts (Vercel) cap buffered responses at 4.5 MB but not streamed ones."""
+
+    def gen():
+        try:
+            with open(path, "rb") as f:
+                while chunk := f.read(1024 * 256):
+                    yield chunk
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    return StreamingResponse(
+        gen(),
+        media_type=media_type,
+        headers={
+            "Content-Length": str(path.stat().st_size),
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+MEDIA = {".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska", ".mov": "video/quicktime", ".mp3": "audio/mpeg",
+         ".m4a": "audio/mp4", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".gif": "image/gif"}
+
+
+def finish(paths: list[Path], workdir: str, base: str) -> StreamingResponse:
     if len(paths) == 1:
         p = paths[0]
-        return FileResponse(p, filename=f"{safe_name(base)}{p.suffix}", background=cleanup)
+        return stream_file(p, workdir, f"{safe_name(base)}{p.suffix}", MEDIA.get(p.suffix.lower(), "application/octet-stream"))
     zpath = Path(workdir) / f"{safe_name(base)}.zip"
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_STORED) as z:
         for i, p in enumerate(sorted(paths), 1):
             z.write(p, f"{i:02d}{p.suffix}")
-    return FileResponse(zpath, filename=zpath.name, media_type="application/zip", background=cleanup)
+    return stream_file(zpath, workdir, zpath.name, "application/zip")
 
 
 def files_in(d: str) -> list[Path]:
@@ -249,7 +301,7 @@ def download(
     name: str = "get-it",
 ):
     url = clean_url(url)
-    workdir = tempfile.mkdtemp(prefix="getit-")
+    workdir = tempfile.mkdtemp(prefix="getit-", dir=TMP)
     try:
         if engine == "gallery":
             cmd = gdl_base() + ["-D", workdir]
@@ -264,15 +316,19 @@ def download(
             if items:
                 extra["playlist_items"] = items
             if quality == "audio":
-                extra["format"] = "ba/b"
-                extra["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
-            elif quality.isdigit():
-                h = int(quality)
-                extra["format"] = f"bv*[height<={h}][vcodec^=avc1]+ba[ext=m4a]/bv*[height<={h}]+ba/b[height<={h}]/b"
+                if FFMPEG:
+                    extra["format"] = "ba/b"
+                    extra["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
+                else:
+                    extra["format"] = "ba[ext=m4a]/ba/b"
+            elif FFMPEG:
+                h = int(quality) if quality.isdigit() else 4320
+                extra["format"] = f"bv*[height<={h}][vcodec^=avc1]+ba[ext=m4a]/bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"
                 extra["merge_output_format"] = "mp4"
             else:
-                extra["format"] = "bv*+ba/b"
-                extra["merge_output_format"] = "mp4"
+                # no ffmpeg: only single files that already carry sound and picture
+                h = int(quality) if quality.isdigit() else 4320
+                extra["format"] = f"b[height<={h}][acodec!=none][vcodec!=none]/b[acodec!=none][vcodec!=none]/b"
             with yt_dlp.YoutubeDL(ydl_opts(**extra)) as ydl:
                 ydl.download([url])
         paths = files_in(workdir)
@@ -301,7 +357,7 @@ async def thumb(u: str):
 
 @app.get("/healthz")
 def health():
-    return {"ok": True, "yt_dlp": yt_dlp.version.__version__}
+    return {"ok": True, "yt_dlp": yt_dlp.version.__version__, "ffmpeg": bool(FFMPEG)}
 
 
 app.mount("/", StaticFiles(directory=STATIC, html=True), name="static")
