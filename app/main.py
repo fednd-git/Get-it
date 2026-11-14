@@ -21,6 +21,7 @@ import yt_dlp
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
@@ -104,6 +105,12 @@ def ydl_opts(**extra) -> dict:
         "noprogress": True,
         "socket_timeout": 20,
         "max_filesize": MAX_FILESIZE,
+        # speed: pull HLS/DASH fragments in parallel, big buffers, no throttled single stream
+        "concurrent_fragment_downloads": 16,
+        "http_chunk_size": 10 * 1024 * 1024,
+        "buffersize": 1024 * 1024,
+        "retries": 3,
+        "fragment_retries": 3,
     }
     if COOKIES and Path(COOKIES).exists():
         opts["cookiefile"] = COOKIES
@@ -129,6 +136,16 @@ def friendly(err: Exception) -> str:
 
 # ---------- yt-dlp ----------
 
+def short_side(f: dict) -> int:
+    """'720p' means the short side: a portrait 720x1280 TikTok is 720p, not 1280p."""
+    w, h = f.get("width") or 0, f.get("height") or 0
+    return min(w, h) if w and h else (h or w)
+
+
+def has_v(f): return f.get("vcodec") not in (None, "none")
+def has_a(f): return f.get("acodec") not in (None, "none")
+
+
 def size_for(formats: list[dict], height: int | None) -> int | None:
     def fs(f):
         return f.get("filesize") or f.get("filesize_approx")
@@ -137,17 +154,17 @@ def size_for(formats: list[dict], height: int | None) -> int | None:
     best_audio = max((fs(f) for f in audio), default=0)
     if height is None:
         return best_audio or None
-    vids = [f for f in formats if f.get("vcodec") not in (None, "none") and (f.get("height") or 0) <= height and fs(f)]
+    vids = [f for f in formats if has_v(f) and short_side(f) <= height * 1.05 and fs(f)]
     if not vids:
         return None
-    top = max(vids, key=lambda f: ((f.get("height") or 0), fs(f)))
+    top = max(vids, key=lambda f: (short_side(f), fs(f)))
     extra = best_audio if top.get("acodec") in (None, "none") else 0
     return fs(top) + extra
 
 
 def item_from_info(info: dict) -> dict:
     formats = info.get("formats") or []
-    heights = sorted({f.get("height") for f in formats if f.get("vcodec") not in (None, "none") and f.get("height")}, reverse=True)
+    heights = sorted({short_side(f) for f in formats if has_v(f) and short_side(f)}, reverse=True)
     has_video = bool(heights) or info.get("vcodec") not in (None, "none") and info.get("ext") in ("mp4", "webm", "mov")
     has_audio = any(f.get("acodec") not in (None, "none") for f in formats) or info.get("acodec") not in (None, "none")
 
@@ -155,7 +172,7 @@ def item_from_info(info: dict) -> dict:
     if heights:
         top = heights[0]
         for h in HEIGHTS:
-            if h <= top and any(x >= h * 0.9 for x in heights):
+            if any(h * 0.75 <= x <= h * 1.05 for x in heights):
                 qualities.append({"id": str(h), "label": f"{h}p", "size": size_for(formats, h)})
         if not qualities:
             qualities.append({"id": str(top), "label": f"{top}p", "size": size_for(formats, top)})
@@ -292,8 +309,91 @@ def files_in(d: str) -> list[Path]:
     return [p for p in Path(d).rglob("*") if p.is_file() and not p.name.endswith((".part", ".json", ".ytdl"))]
 
 
+# ---------- fast path: relay the source file straight to the phone ----------
+
+DIRECT_PROTOCOLS = {"http", "https"}
+
+
+def codec_rank(f: dict) -> int:
+    v = (f.get("vcodec") or "").lower()
+    return 2 if v.startswith(("avc", "h264")) else 1 if v.startswith(("hev", "h265", "hvc", "vp9", "vp09")) else 0
+
+
+def plan(url: str, quality: str) -> dict:
+    """Read the post once and decide the fastest way to deliver the asked quality.
+    direct: one ready-made file with sound and picture -> relay it straight from the CDN.
+    spec:   exact format ids for yt-dlp to fetch (in parallel) and merge."""
+    with yt_dlp.YoutubeDL(ydl_opts(skip_download=True, noplaylist=True)) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if not info or info.get("_type") == "playlist" or info.get("entries"):
+        return {}
+    formats = [f for f in (info.get("formats") or [info]) if f.get("url")]
+    if quality == "audio":
+        return {}
+    q = int(quality) if quality.isdigit() else 10**6
+    top_short = max((short_side(f) for f in formats if has_v(f)), default=0)
+    want = min(q, top_short) if top_short else q
+
+    prog = [f for f in formats if has_v(f) and has_a(f) and f.get("protocol") in ("http", "https")
+            and short_side(f) <= q * 1.05]
+    if prog:
+        best = max(prog, key=lambda f: (short_side(f), codec_rank(f), f.get("tbr") or 0))
+        if not want or short_side(best) >= want * 0.85:
+            headers = dict(best.get("http_headers") or info.get("http_headers") or {})
+            try:  # CDNs like TikTok's only serve the file to the session that read the post
+                cookie = ydl.cookiejar.get_cookie_header(best["url"])
+                if cookie:
+                    headers["Cookie"] = cookie
+            except Exception:  # noqa: BLE001
+                pass
+            return {"direct": {
+                "url": best["url"],
+                "headers": headers,
+                "ext": best.get("ext") or "mp4",
+            }}
+    vids = [f for f in formats if has_v(f) and short_side(f) <= q * 1.05]
+    auds = [f for f in formats if has_a(f) and not has_v(f)]
+    if vids and auds and FFMPEG:
+        v = max(vids, key=lambda f: (short_side(f), codec_rank(f), f.get("tbr") or 0))
+        a = max(auds, key=lambda f: ((f.get("ext") == "m4a"), f.get("abr") or f.get("tbr") or 0))
+        if has_a(v):
+            return {"spec": v["format_id"]}
+        return {"spec": f"{v['format_id']}+{a['format_id']}"}
+    if vids:
+        v = max(vids, key=lambda f: (has_a(f), short_side(f), codec_rank(f)))
+        return {"spec": v["format_id"]}
+    return {}
+
+
+async def relay(src: dict, name: str):
+    client = httpx.AsyncClient(timeout=httpx.Timeout(30, read=60), follow_redirects=True, http2=False,
+                               limits=httpx.Limits(max_connections=4))
+    req = client.build_request("GET", src["url"], headers=src["headers"])
+    upstream = await client.send(req, stream=True)
+    if upstream.status_code >= 400:
+        print(f"[get-it] relay got {upstream.status_code}, falling back", flush=True)
+        await upstream.aclose()
+        await client.aclose()
+        return None
+
+    async def body():
+        try:
+            async for chunk in upstream.aiter_raw(1024 * 512):
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    headers = {"Content-Disposition": f'attachment; filename="{safe_name(name)}.{src["ext"]}"', "Cache-Control": "no-store",
+               "X-Getit-Path": "relay"}
+    length = upstream.headers.get("content-length")
+    if length and not upstream.headers.get("content-encoding"):
+        headers["Content-Length"] = length
+    return StreamingResponse(body(), media_type=MEDIA.get("." + src["ext"], "video/mp4"), headers=headers)
+
+
 @app.get("/api/download")
-def download(
+async def download(
     url: str,
     quality: str = "best",
     engine: str = "ytdlp",
@@ -301,6 +401,32 @@ def download(
     name: str = "get-it",
 ):
     url = clean_url(url)
+    spec = None
+    if engine == "ytdlp" and not items:
+        try:
+            p = await run_in_threadpool(plan, url, quality)
+        except Exception as e:  # noqa: BLE001
+            print(f"[get-it] plan failed: {e}", flush=True)
+            p = {}
+        if p.get("direct"):
+            try:
+                resp = await relay(p["direct"], name)
+                if resp:
+                    return resp
+            except Exception as e:  # noqa: BLE001
+                print(f"[get-it] relay failed, falling back: {e}", flush=True)
+        spec = p.get("spec")
+    return await run_in_threadpool(download_saved, url, quality, engine, items, name, spec)
+
+
+def download_saved(
+    url: str,
+    quality: str = "best",
+    engine: str = "ytdlp",
+    items: str = Query("", description="comma list of 1-based item numbers; empty = all"),
+    name: str = "get-it",
+    spec: str | None = None,
+):
     workdir = tempfile.mkdtemp(prefix="getit-", dir=TMP)
     try:
         if engine == "gallery":
@@ -321,6 +447,10 @@ def download(
                     extra["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
                 else:
                     extra["format"] = "ba[ext=m4a]/ba/b"
+            elif spec:
+                extra["format"] = spec
+                extra["merge_output_format"] = "mp4"
+                extra["noplaylist"] = True
             elif FFMPEG:
                 h = int(quality) if quality.isdigit() else 4320
                 extra["format"] = f"bv*[height<={h}][vcodec^=avc1]+ba[ext=m4a]/bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"
