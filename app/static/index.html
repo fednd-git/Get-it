@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0d1112">
+<meta name="description" content="Paste a link from Instagram, TikTok, Facebook, X and more. Get the video or image.">
+<title>Get-it</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Host+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/regular/style.css">
+<link rel="stylesheet" href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/fill/style.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="field" aria-hidden="true"><span class="f1"></span><span class="f2"></span><span class="f3"></span></div>
+
+<main class="shell">
+  <header class="top">
+    <div class="mark"><i class="ph-fill ph-arrow-down"></i></div>
+    <span class="wordmark">Get-it</span>
+  </header>
+
+  <section class="glass paste" id="pasteCard">
+    <h1>Paste a link. Get the file.</h1>
+    <p class="sub">Instagram, TikTok, Facebook, X, YouTube and 1,000+ more.</p>
+
+    <form id="form" autocomplete="off">
+      <label for="url" class="sr">Post link</label>
+      <div class="input">
+        <span class="badge" id="badge" aria-hidden="true"><i class="ph ph-link-simple"></i></span>
+        <input id="url" name="url" type="url" inputmode="url" placeholder="https://www.instagram.com/p/…" enterkeyhint="go">
+        <button type="button" class="clear" id="clear" aria-label="Clear link" hidden><i class="ph ph-x"></i></button>
+      </div>
+      <div class="row">
+        <button type="button" class="btn ghost" id="pasteBtn"><i class="ph ph-clipboard-text"></i>Paste</button>
+        <button type="submit" class="btn primary" id="goBtn"><span>Find it</span></button>
+      </div>
+    </form>
+    <p class="err" id="err" role="alert" hidden></p>
+  </section>
+
+  <section class="glass result" id="result" hidden>
+    <div class="media">
+      <div class="thumb" id="thumb"><span class="dur" id="dur" hidden></span></div>
+      <div class="meta">
+        <div class="from"><span class="logo" id="logo"></span><span id="author"></span></div>
+        <p class="title" id="title"></p>
+        <p class="kind" id="kindLine"></p>
+      </div>
+    </div>
+
+    <div class="grid" id="grid" hidden>
+      <div class="gridhead">
+        <span id="pickCount"></span>
+        <button type="button" class="link" id="selAll">Select all</button>
+      </div>
+      <div class="tiles" id="tiles"></div>
+    </div>
+
+    <div class="chips" id="chips" role="radiogroup" aria-label="Quality"></div>
+
+    <button class="btn primary big" id="dl">
+      <span class="fill" id="fill"></span>
+      <span class="lbl" id="dlLabel">Download</span>
+    </button>
+  </section>
+
+  <section class="recent" id="recentWrap" hidden>
+    <div class="recenthead"><h2>Recent</h2><button class="link" id="clearRecent">Clear</button></div>
+    <ul id="recent"></ul>
+  </section>
+
+  <footer class="foot">Download only what you have the right to save.</footer>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
