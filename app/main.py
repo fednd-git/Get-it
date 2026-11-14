@@ -300,7 +300,7 @@ def blocked(e: Exception) -> bool:
     ))
 
 
-_INFO_CACHE: dict[tuple, tuple[float, dict, dict]] = {}
+_INFO_CACHE: dict[tuple, tuple] = {}
 _INFO_CACHE_TTL = 300  # seconds; media URLs stay signed far longer than this
 _INFO_CACHE_MAX = 64
 
@@ -338,7 +338,9 @@ def extract(url: str, budget_s: float = 75, **opts):
         key = (url, json.dumps(v, sort_keys=True), json.dumps(opts, sort_keys=True, default=str))
         hit = _INFO_CACHE.get(key)
         if hit and time.monotonic() - hit[0] < _INFO_CACHE_TTL:
-            return hit[1], None, hit[2]
+            # hand back the YoutubeDL that read the post: its cookie jar holds the
+            # session cookies (TikTok's tt_chain_token) the CDN wants for the relay
+            return hit[1], hit[3], hit[2]
         ydl = yt_dlp.YoutubeDL(ydl_opts(**opts, **v))
         try:
             info = ydl.extract_info(url, download=False)
@@ -346,7 +348,7 @@ def extract(url: str, budget_s: float = 75, **opts):
                 _yt_winner = v["extractor_args"]["youtube"]["player_client"]
             if len(_INFO_CACHE) >= _INFO_CACHE_MAX:
                 _INFO_CACHE.pop(next(iter(_INFO_CACHE)))
-            _INFO_CACHE[key] = (time.monotonic(), info, v)
+            _INFO_CACHE[key] = (time.monotonic(), info, v, ydl)
             return info, ydl, v
         except Exception as e:  # noqa: BLE001
             last = e
