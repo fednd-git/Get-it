@@ -14,7 +14,7 @@ import sys
 import tempfile
 import time
 import zipfile
-from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -33,6 +33,10 @@ from starlette.background import BackgroundTask
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
 PROXY = os.environ.get("PROXY")  # optional http(s)/socks proxy, e.g. a residential one, for sites that block cloud servers
+# PO_TOKEN: a pre-generated YouTube Proof-of-Origin token, e.g. "web.gvs+<base64url token>".
+# YouTube asks for one when it flags the server's IP. A token is good for hours/days,
+# then it has to be refreshed. Cookies (COOKIES_TXT) are the more reliable fix.
+PO_TOKEN = os.environ.get("PO_TOKEN")
 
 
 def _cookies_path() -> str | None:
@@ -133,7 +137,7 @@ def ydl_opts(**extra) -> dict:
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
-        "socket_timeout": 12,
+        "socket_timeout": 20,  # Meta's pages can take a while to answer when they tar-pit a cloud IP
         "max_filesize": MAX_FILESIZE,
         # speed: pull HLS/DASH fragments in parallel, big buffers, no throttled single stream
         "concurrent_fragment_downloads": 16,
@@ -165,6 +169,16 @@ def _strip_ytdlp_footer(msg: str) -> str:
     return msg
 
 
+def _meta_login_msg(platform: str) -> str:
+    """The one fix for every Meta failure from a cloud server: Meta serves
+    nothing to a browser it doesn't recognise, so the app needs the user's
+    own logged-in session (cookies)."""
+    name = "Facebook" if platform == "facebook" else "Instagram"
+    return (f"{name} only shows this to logged-in browsers from this server. Fix: export your browser "
+            "cookies as cookies.txt and add them as COOKIES_TXT in Vercel "
+            "(Project → Settings → Environment Variables), then redeploy.")
+
+
 def friendly(err: Exception, downloading: bool = False, platform: str = "web") -> str:
     print(f"[get-it] {type(err).__name__}: {err}", flush=True)  # real reason shows in the host's logs
     msg = _strip_ytdlp_footer(str(err).lower())
@@ -179,9 +193,14 @@ def friendly(err: Exception, downloading: bool = False, platform: str = "web") -
             or "failed to extract any player response" in msg
             or "po token" in msg or "the page needs to be reloaded" in msg or "no video formats found" in msg):
         if platform == "youtube":
-            return "YouTube is blocking the server right now, not your video. Try again in a minute."
+            return ("YouTube is blocking the server right now, not your video. "
+                    "Adding your cookies as COOKIES_TXT in Vercel usually fixes it — or try again in a minute.")
+        if platform in ("facebook", "instagram"):
+            return _meta_login_msg(platform)
         return "The platform is blocking the server right now, not your video. Try again in a minute."
     if "login" in msg or "sign in" in msg or "log in" in msg:
+        if platform in ("facebook", "instagram"):
+            return _meta_login_msg(platform)
         return "This post needs a login to view."
     if "unsupported url" in msg:
         return "This site isn't supported yet."
@@ -190,7 +209,15 @@ def friendly(err: Exception, downloading: bool = False, platform: str = "web") -
     if "max_filesize" in msg or "larger than" in msg:
         return "That file is too big for this server."
     if "timed out" in msg or "timeout" in msg or "connection" in msg:
+        if platform in ("facebook", "instagram"):
+            # Meta stalls requests from a server it doesn't recognise instead of
+            # answering — a login wall in slow motion. Retrying won't help.
+            return _meta_login_msg(platform)
         return "The platform took too long to respond. Try again in a minute."
+    if platform in ("facebook", "instagram"):
+        # Without a login, Meta serves nothing to this server — whatever the
+        # exact error was (403, empty page, bad response), the fix is the same.
+        return _meta_login_msg(platform)
     if downloading:
         return "Couldn't download this one. Try another quality, or try again in a minute."
     return "Couldn't read that link. Check it opens in your browser, then try again."
@@ -281,8 +308,23 @@ def variants(url: str) -> list[dict]:
             {},
         ]
     if plat == "youtube":
-        order = ([_yt_winner] if _yt_winner else []) + [c for c in YT_CLIENTS if c != _yt_winner]
-        return [{} if c is None else {"extractor_args": {"youtube": {"player_client": c}}} for c in order]
+        # winner first, then every client in turn — including the default web
+        # client (None). The old list-comprehension dropped None when there was
+        # no winner yet, so the default client — the one a PO token applies
+        # to — was never tried on a fresh server.
+        order = ([_yt_winner] if _yt_winner else [None]) + [c for c in YT_CLIENTS if c != _yt_winner]
+        out = []
+        for c in order:
+            args: dict = {}
+            if c is not None:
+                args["player_client"] = c
+            if PO_TOKEN:
+                # format: "web.gvs+<token>" or "web+<token>"; a pre-generated token
+                # proves the request came from a real browser session. It only
+                # applies to the client named in it (usually web, the first variant).
+                args["po_token"] = [PO_TOKEN]
+            out.append({} if not args else {"extractor_args": {"youtube": args}})
+        return out
     return [{}]
 
 
@@ -320,7 +362,7 @@ def _cookie_header(url: str) -> str:
         return ""
 
 
-def extract(url: str, budget_s: float = 75, **opts):
+def extract(url: str, budget_s: float = 60, **opts):
     """extract_info with platform fallback. Returns (info, ydl, variant).
 
     A 5-minute in-memory cache means the download re-uses the probe the info
@@ -358,7 +400,7 @@ def extract(url: str, budget_s: float = 75, **opts):
 
 
 def probe_ytdlp(url: str) -> dict:
-    info, _ydl, _ = extract(url, skip_download=True, extract_flat=False, playlistend=50)
+    info, _ydl, _ = extract(url, budget_s=40, skip_download=True, extract_flat=False, playlistend=50)
     # sanitize_info is a static method that returns a fresh dict, so it is safe
     # on the cached raw info (the cache keeps the raw copy for plan()).
     info = yt_dlp.YoutubeDL.sanitize_info(info)
@@ -444,21 +486,27 @@ def info(link: Link):
     try:
         done, _ = wait([ytdlp_fut], timeout=8)
         if ytdlp_fut not in done and not (gallery_fut.done() and has_media("gallery")):
-            wait([ytdlp_fut], return_when=ALL_COMPLETED)
+            # Bound the whole lookup to ~50s. Vercel's free tier kills the
+            # function at 60s, and a bot-checked lookup used to burn past that
+            # and die with no answer at all. Better to reply in 50s with the
+            # best error than to be killed at 60s with nothing.
+            wait([ytdlp_fut], timeout=35)
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
 
     data = results.get("ytdlp")
     if not (isinstance(data, dict) and has_media("ytdlp")):
-        # yt-dlp gave no media: give gallery-dl a chance to finish, then use it.
+        # yt-dlp gave no media: give gallery-dl a short chance to finish, then use it.
         if not gallery_fut.done():
-            wait([gallery_fut], timeout=30)
+            wait([gallery_fut], timeout=7)
         data = results.get("gallery")
     if isinstance(data, dict):
         return {"url": url, "platform": platform, **data}
     err = results.get("ytdlp") if isinstance(results.get("ytdlp"), Exception) else results.get("gallery")
-    raise HTTPException(422, friendly(err if isinstance(err, Exception) else RuntimeError("no downloadable media"),
-                                platform=platform))
+    if not isinstance(err, Exception):
+        # both engines were still running when the time budget ran out
+        err = RuntimeError("timed out")
+    raise HTTPException(422, friendly(err, platform=platform))
 
 
 def safe_name(s: str, fallback: str = "get-it") -> str:

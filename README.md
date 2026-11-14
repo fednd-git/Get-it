@@ -32,13 +32,18 @@ Then on your phone, open the link in Chrome, tap ⋮ and **Install app**. Get-it
 
 ## YouTube, private posts and blocked sites
 
-YouTube and Instagram sometimes refuse requests from cloud servers (Vercel, Render) with a "confirm you're not a bot" check, even for public videos. Get-it already retries through several YouTube app clients. If a site keeps refusing:
+**Facebook and Instagram need a login now.** Meta only serves their videos to logged-in browsers from cloud servers, even public posts — without cookies every link fails with a login error (or stalls forever). The fix is your own cookies:
 
 1. Sign in to that site in a desktop browser with a **spare** account.
 2. Export its cookies as `cookies.txt` (Netscape format) with an extension like "Get cookies.txt LOCALLY".
 3. On Vercel: Project, Settings, Environment Variables, add `COOKIES_TXT` with the file's contents (or base64 of it). Redeploy.
 
-A residential proxy in `PROXY` also gets past cloud-IP blocks.
+The same cookies also fix YouTube when it throws its "confirm you're not a bot" check at the server. Get-it already retries YouTube through several app clients, and the lookup is capped to answer within ~50 seconds — Vercel's free tier kills a function at 60 seconds, so a slow bot-checked lookup used to die with no answer at all.
+
+Two more levers, only if cookies aren't enough:
+
+- `PO_TOKEN`: a pre-generated YouTube Proof-of-Origin token, format `web.gvs+<token>`. It proves the request came from a real browser, but it expires after hours/days and has to be refreshed — cookies last longer.
+- `PROXY`: a residential proxy also gets past cloud-IP blocks. This one costs money; cookies are free.
 
 ## Settings
 
@@ -46,6 +51,7 @@ A residential proxy in `PROXY` also gets past cloud-IP blocks.
 |---|---|---|
 | `COOKIES_TXT` | none | Contents of a cookies.txt (raw or base64), for bot checks and login-only posts |
 | `COOKIES_FILE` | none | Path to a cookies.txt instead (Docker hosts) |
+| `PO_TOKEN` | none | Pre-generated YouTube Proof-of-Origin token, e.g. `web.gvs+<token>`; expires, refresh when YouTube blocks again |
 | `PROXY` | none | http/https/socks proxy for sites that block cloud servers |
 | `MAX_FILESIZE_MB` | 500 | Biggest file the server will fetch |
 | `PORT` | 8000 | Port to listen on (Docker) |
